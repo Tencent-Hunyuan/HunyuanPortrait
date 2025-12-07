@@ -1,7 +1,9 @@
 import argparse
 import os
 import torch
+import cv2
 import numpy as np
+from PIL import Image
 import onnxruntime as ort
 from omegaconf import OmegaConf
 from diffusers import AutoencoderKLTemporalDecoder
@@ -9,7 +11,7 @@ from moviepy.editor import VideoFileClip
 from einops import rearrange
 from datetime import datetime
 from src.dataset.test_preprocess import preprocess
-from src.dataset.utils import save_videos_grid, seed_everything, get_head_exp_motion_bucketid
+from src.dataset.utils import save_videos_grid, save_videos_from_pil, seed_everything, get_head_exp_motion_bucketid
 from src.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
 from src.pipelines.hunyuan_svd_pipeline import HunyuanLongSVDPipeline
 from src.models.condition.unet_3d_svd_condition_ip import UNet3DConditionSVDModel, init_ip_adapters
@@ -17,6 +19,63 @@ from src.models.condition.coarse_motion import HeadExpression, HeadPose
 from src.models.condition.refine_motion import IntensityAwareMotionRefiner
 from src.models.condition.pose_guider import PoseGuider
 from src.models.dinov2.models.vision_transformer import vit_large, ImageProjector
+
+
+def create_soft_mask(size, border_ratio=0.1):
+    """
+    create a soft mask with edge blurring for smooth blending.
+    size: (width, height)
+    """
+    w, h = size
+    mask = np.ones((h, w), dtype=np.float32)
+    
+    # calculate the number of pixels for edge blurring
+    border_w = int(w * border_ratio)
+    border_h = int(h * border_ratio)
+    
+    # horizontal direction gradient
+    if border_w > 0:
+        mask[:, :border_w] = np.linspace(0, 1, border_w)[None, :]
+        mask[:, -border_w:] = np.linspace(1, 0, border_w)[None, :]
+    
+    # vertical direction gradient
+    if border_h > 0:
+        mask[:border_h, :] *= np.linspace(0, 1, border_h)[:, None]
+        mask[-border_h:, :] *= np.linspace(1, 0, border_h)[:, None]
+        
+    return mask[..., None] # add channel dimension (H, W, 1)
+
+
+def paste_back_frame(original_img, generated_crop, crop_bbox, mask=None):
+    """
+    paste the generated cropped frame back to the original image
+    original_img: original image numpy array
+    generated_crop: generated 512x512 face frame
+    crop_bbox: [x1, y1, x2, y2]
+    """
+    x1, y1, x2, y2 = crop_bbox
+    target_w = x2 - x1
+    target_h = y2 - y1
+    
+    # 1. resize the generated face back to the size of the original crop box
+    generated_resized = cv2.resize(generated_crop, (target_w, target_h))
+    
+    # 2. if no mask is provided, create a new one
+    if mask is None:
+        mask = create_soft_mask((target_w, target_h))
+        
+    # 3. get the corresponding region in the original image
+    background_region = original_img[y1:y2, x1:x2].astype(np.float32) / 255.0
+    foreground_region = generated_resized.astype(np.float32) / 255.0
+    
+    # 4. blend: Result = Gen * Mask + BG * (1 - Mask)
+    blended_region = foreground_region * mask + background_region * (1 - mask)
+    
+    # 5. paste back to the original image
+    result_img = original_img.copy()
+    result_img[y1:y2, x1:x2] = (blended_region * 255).astype(np.uint8)
+    
+    return result_img
 
 
 @torch.no_grad()
@@ -32,8 +91,8 @@ def main(cfg, args):
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_video_path = os.path.join(output_dir, f'{image_name}_{video_name}_{timestamp}.mp4')
-    print(f"Generating and writing to: {save_video_path}")
+    save_video_path = os.path.join(output_dir, f'{timestamp}_{image_name}_{video_name}', 'cropped.mp4')
+    print(f"Generating and writing to: {output_dir}/{timestamp}_{image_name}_{video_name}")
 
     if cfg.seed is not None:
         seed_everything(cfg.seed)
@@ -142,6 +201,10 @@ def main(cfg, args):
     
     sample = preprocess(image_path, video_path, limit=cfg.frame_num, 
             image_size=cfg.arcface_img_size, area=cfg.area, det_path=cfg.det_path)
+    
+    original_image = sample['original_image'] # Numpy array (H, W, C), RGB format
+    crop_bbox = sample['crop_bbox'] # [x1, y1, x2, y2]
+
     ref_img = sample['ref_img'].unsqueeze(0).to('cuda')
     transformed_images = sample['transformed_images'].unsqueeze(0).to('cuda')
     arcface_img = sample['arcface_image']
@@ -256,8 +319,34 @@ def main(cfg, args):
     video = (video*0.5 + 0.5).clamp(0, 1).cpu()
     if cfg.pad_frames > 0:
         video = video[:, :, cfg.pad_frames:-cfg.pad_frames]
+
+    # start paste back processing
+    save_video_path_paste_back = os.path.join(output_dir, f'{timestamp}_{image_name}_{video_name}', 'full_resolution.mp4')
+    
+    # convert video tensor dimension: (batch, channels, frames, h, w) -> (frames, h, w, channels)
+    generated_frames = video[0].permute(1, 2, 3, 0).numpy() # (T, H, W, C)
+    generated_frames = (generated_frames * 255).astype(np.uint8)
+    
+    final_frames = []
+    
+    # pre-compute mask to avoid duplicate computation in loop
+    x1, y1, x2, y2 = crop_bbox
+    soft_mask = create_soft_mask((x2 - x1, y2 - y1))
+    
+    print("Processing paste back...")
+    for i in range(len(generated_frames)):
+        gen_frame = generated_frames[i]
+        
+        # paste back frame
+        full_frame = paste_back_frame(original_image, gen_frame, crop_bbox, soft_mask)
+        
+        final_frames.append(Image.fromarray(full_frame))
+
     video_clip = VideoFileClip(video_path)
     save_videos_grid(video, save_video_path, n_rows=1, fps=video_clip.fps)
+    print(f"Saved generated video to {save_video_path}")
+    save_videos_from_pil(final_frames, save_video_path_paste_back, fps=video_clip.fps)
+    print(f"Saved paste-back video to {save_video_path_paste_back}")
 
 
 if __name__ == "__main__":
