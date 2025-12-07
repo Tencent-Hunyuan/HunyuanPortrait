@@ -248,6 +248,8 @@ def preprocess(image_path, video_path, limit=100, image_size=512, area=1.25, det
         motion_pose_image=torch.stack(driven_pose_images_list, dim=0),
         driven_image=torch.stack(driven_image_tensor_list, dim=0),
         lmk_list=lmk_list,
+        crop_bbox=crop_bbox,
+        original_image=origin_src,
     )
 
     return sample
